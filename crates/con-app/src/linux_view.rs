@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use con_ghostty::cursor::{CursorBlink, CursorStyle};
 use con_ghostty::vt::{
     SelectionAutoscroll, SelectionAutoscrollUpdate, SelectionGeometry, SelectionPoint, VtKeyAction,
-    VtKeyEvent, VtKeyModifiers, VtPasteResult, VtPasteSource,
+    VtKeyEvent, VtKeyModifiers, VtMouseAction, VtMouseButton, VtMouseEvent, VtMouseModifiers,
+    VtPasteResult, VtPasteSource,
 };
 use con_ghostty::{
     ATTR_BOLD, ATTR_INVERSE, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, DesktopNotification,
@@ -293,12 +294,14 @@ pub struct GhosttyView {
     suppress_link_mouse_up: bool,
     hovered_link: Option<TerminalLink>,
     last_mouse_position: Option<Point<Pixels>>,
+    mouse_modifiers: Modifiers,
     terminal_left_mouse_sequence: MouseButtonSequence<LeftMouseSequence>,
     /// Whether the most recent right-button press was consumed by the
-    /// terminal app (an SGR report emitted). The context-menu builder
+    /// terminal app (a mouse report emitted). The context-menu builder
     /// suppresses con's menu only when this is true.
     terminal_mouse_right_consumed: Option<bool>,
-    terminal_right_mouse_sequence: MouseButtonSequence<bool>,
+    terminal_right_mouse_sequence: MouseButtonSequence<()>,
+    terminal_middle_mouse_sequence: MouseButtonSequence<()>,
     selection_autoscroll_epoch: u64,
     selection_autoscroll_active: bool,
     keys_awaiting_release: HashMap<String, crate::terminal_keys::TrackedVtKey>,
@@ -403,9 +406,11 @@ impl GhosttyView {
             suppress_link_mouse_up: false,
             hovered_link: None,
             last_mouse_position: None,
+            mouse_modifiers: Modifiers::default(),
             terminal_left_mouse_sequence: MouseButtonSequence::default(),
             terminal_mouse_right_consumed: None,
             terminal_right_mouse_sequence: MouseButtonSequence::default(),
+            terminal_middle_mouse_sequence: MouseButtonSequence::default(),
             selection_autoscroll_epoch: 0,
             selection_autoscroll_active: false,
             keys_awaiting_release: HashMap::new(),
@@ -557,6 +562,7 @@ impl GhosttyView {
         self.terminal_left_mouse_sequence = MouseButtonSequence::default();
         self.terminal_mouse_right_consumed = None;
         self.terminal_right_mouse_sequence = MouseButtonSequence::default();
+        self.terminal_middle_mouse_sequence = MouseButtonSequence::default();
         self.stop_selection_autoscroll();
         self.keys_awaiting_release.clear();
         self.pending_unsafe_paste = None;
@@ -910,20 +916,42 @@ impl GhosttyView {
     }
 
     fn cell_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
-        self.cell_from_event_position_impl(pos, false)
+        self.selection_input_from_event_position(pos, false)
+            .map(|(point, _)| (point.col, point.row))
     }
 
-    fn clamped_cell_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
-        self.cell_from_event_position_impl(pos, true)
-    }
-
-    fn cell_from_event_position_impl(
+    fn report_mouse(
         &self,
         pos: Point<Pixels>,
-        clamp_to_grid: bool,
-    ) -> Option<(u16, u16)> {
-        self.selection_input_from_event_position(pos, clamp_to_grid)
-            .map(|(point, _)| (point.col, point.row))
+        action: VtMouseAction,
+        button: Option<VtMouseButton>,
+    ) -> bool {
+        // The encoder clamps captured drags/releases to the grid. An initial
+        // press (including wheel buttons) in padding must not hit an edge cell.
+        if action == VtMouseAction::Press && self.cell_from_event_position(pos).is_none() {
+            return false;
+        }
+        let Some(bounds) = self.pane_bounds else {
+            return false;
+        };
+        let scale = self.scale_factor.max(f32::EPSILON);
+        self.terminal().is_some_and(|terminal| {
+            terminal.mouse_event(VtMouseEvent {
+                action,
+                button,
+                // Shift starts a local gesture, but must not suppress release
+                // of an already captured terminal gesture.
+                modifiers: VtMouseModifiers {
+                    shift: self.mouse_modifiers.shift,
+                    control: self.mouse_modifiers.control,
+                    alt: self.mouse_modifiers.alt,
+                },
+                surface_x_px: (f32::from(pos.x) - f32::from(bounds.origin.x)) * scale
+                    - (TERMINAL_PADDING_X_PX * scale).round(),
+                surface_y_px: (f32::from(pos.y) - f32::from(bounds.origin.y)) * scale
+                    - (TERMINAL_PADDING_Y_PX * scale).round(),
+            })
+        })
     }
 
     fn selection_input_from_event_position(
@@ -1007,6 +1035,7 @@ impl GhosttyView {
         let changed = self.hovered_link.take().is_some();
         if !self.terminal_left_mouse_sequence.is_active()
             && !self.terminal_right_mouse_sequence.is_active()
+            && !self.terminal_middle_mouse_sequence.is_active()
         {
             self.last_mouse_position = None;
         }
@@ -1054,7 +1083,7 @@ impl GhosttyView {
 
         match sequence {
             LeftMouseSequence::TerminalReport => {
-                terminal.mouse_motion_report(point.col, point.row, false)
+                self.report_mouse(pos, VtMouseAction::Motion, Some(VtMouseButton::Left))
             }
             LeftMouseSequence::LocalSelection => match terminal.selection_drag(point, geometry) {
                 Ok(autoscroll) => {
@@ -1071,6 +1100,47 @@ impl GhosttyView {
         }
     }
 
+    fn update_mouse_sequences(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        // GPUI Wayland clears its single pressed-button slot when *any* button
+        // is released. Only matching mouse-up or focus cancellation ends our
+        // captures; a buttonless move may still belong to a held chord button.
+        let button = event.pressed_button.or_else(|| {
+            if self.terminal_left_mouse_sequence.is_active() {
+                Some(MouseButton::Left)
+            } else if self.terminal_middle_mouse_sequence.is_active() {
+                Some(MouseButton::Middle)
+            } else if self.terminal_right_mouse_sequence.is_active() {
+                Some(MouseButton::Right)
+            } else {
+                None
+            }
+        });
+        match button {
+            Some(MouseButton::Left) => self.update_left_mouse_sequence(event.position, cx),
+            Some(MouseButton::Middle) if self.terminal_middle_mouse_sequence.is_active() => {
+                self.report_mouse(
+                    event.position,
+                    VtMouseAction::Motion,
+                    Some(VtMouseButton::Middle),
+                );
+                false
+            }
+            Some(MouseButton::Right) if self.terminal_right_mouse_sequence.is_active() => {
+                self.report_mouse(
+                    event.position,
+                    VtMouseAction::Motion,
+                    Some(VtMouseButton::Right),
+                );
+                false
+            }
+            None if !event.modifiers.shift => {
+                self.report_mouse(event.position, VtMouseAction::Motion, None);
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn finish_left_mouse_sequence(&mut self, pos: Point<Pixels>) -> bool {
         self.stop_selection_autoscroll();
         let Some(sequence) = self.terminal_left_mouse_sequence.finish() else {
@@ -1084,9 +1154,7 @@ impl GhosttyView {
         };
         match sequence {
             LeftMouseSequence::TerminalReport => {
-                if let Some(point) = point {
-                    terminal.mouse_release(0, point.col, point.row, false);
-                }
+                self.report_mouse(pos, VtMouseAction::Release, Some(VtMouseButton::Left));
             }
             LeftMouseSequence::LocalSelection => {
                 if let Err(err) =
@@ -1101,15 +1169,19 @@ impl GhosttyView {
     }
 
     fn finish_right_mouse_sequence(&mut self, pos: Point<Pixels>) -> bool {
-        let Some(shift) = self.terminal_right_mouse_sequence.finish() else {
+        let Some(_) = self.terminal_right_mouse_sequence.finish() else {
             return false;
         };
 
-        if let Some(terminal) = self.terminal()
-            && let Some((col, row)) = self.clamped_cell_from_event_position(pos)
-        {
-            terminal.mouse_release(2, col, row, shift);
-        }
+        self.report_mouse(pos, VtMouseAction::Release, Some(VtMouseButton::Right));
+        true
+    }
+
+    fn finish_middle_mouse_sequence(&mut self, pos: Point<Pixels>) -> bool {
+        let Some(_) = self.terminal_middle_mouse_sequence.finish() else {
+            return false;
+        };
+        self.report_mouse(pos, VtMouseAction::Release, Some(VtMouseButton::Middle));
         true
     }
 
@@ -1133,10 +1205,12 @@ impl GhosttyView {
                 terminal.selection_cancel_gesture();
             }
             self.terminal_right_mouse_sequence.finish();
+            self.terminal_middle_mouse_sequence.finish();
             return;
         };
         self.cancel_left_pointer_interactions(position);
         self.finish_right_mouse_sequence(position);
+        self.finish_middle_mouse_sequence(position);
     }
 
     fn update_selection_autoscroll(
@@ -2287,6 +2361,7 @@ impl Render for GhosttyView {
             }))
             .on_modifiers_changed(cx.listener(
                 |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.mouse_modifiers = event.modifiers;
                     if this.update_hovered_link(&event.modifiers) {
                         cx.notify();
                     }
@@ -2303,23 +2378,20 @@ impl Render for GhosttyView {
                     window.focus(&context_focus, cx);
                     let _ = this.ensure_session(cx);
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
                     this.finish_right_mouse_sequence(event.position);
                     let _ = this.update_hovered_link(&event.modifiers);
-                    // SGR button 2 = right; unconsumed when tracking is off.
-                    // Record the press shift state so the matching release
-                    // isn't rejected if Shift changes between press/release.
                     let shift_at_press = event.modifiers.shift;
-                    this.terminal_mouse_right_consumed = if let Some(terminal) = this.terminal() {
-                        if let Some((col, row)) = this.cell_from_event_position(event.position) {
-                            Some(terminal.mouse_report(2, col, row, shift_at_press))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    this.terminal_mouse_right_consumed = Some(
+                        !shift_at_press
+                            && this.report_mouse(
+                                event.position,
+                                VtMouseAction::Press,
+                                Some(VtMouseButton::Right),
+                            ),
+                    );
                     if this.terminal_mouse_right_consumed == Some(true) {
-                        this.terminal_right_mouse_sequence.begin(shift_at_press);
+                        this.terminal_right_mouse_sequence.begin(());
                     }
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
@@ -2331,6 +2403,7 @@ impl Render for GhosttyView {
                     window.focus(&focus, cx);
                     let _ = this.ensure_session(cx);
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
                     this.cancel_left_pointer_interactions(event.position);
                     let preview = this.hovered_link.take();
                     let _ = this.update_hovered_link(&event.modifiers);
@@ -2344,19 +2417,18 @@ impl Render for GhosttyView {
                         return;
                     }
                     let shift = event.modifiers.shift;
-                    let tracking_active = this
-                        .terminal()
-                        .is_some_and(|terminal| terminal.mouse_tracking_active());
-                    if tracking_active && !shift {
+                    if !shift
+                        && this.report_mouse(
+                            event.position,
+                            VtMouseAction::Press,
+                            Some(VtMouseButton::Left),
+                        )
+                    {
                         if let Some(terminal) = this.terminal() {
                             terminal.selection_cancel_gesture();
-                            if let Some((col, row)) = this.cell_from_event_position(event.position)
-                                && terminal.mouse_report(0, col, row, false)
-                            {
-                                this.terminal_left_mouse_sequence
-                                    .begin(LeftMouseSequence::TerminalReport);
-                            }
                         }
+                        this.terminal_left_mouse_sequence
+                            .begin(LeftMouseSequence::TerminalReport);
                     } else if !this.begin_local_selection(event.position, shift, event.click_count)
                         && !shift
                     {
@@ -2368,6 +2440,7 @@ impl Render for GhosttyView {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 this.last_mouse_position = Some(event.position);
+                this.mouse_modifiers = event.modifiers;
                 if this.suppress_link_mouse_up {
                     if event.pressed_button == Some(MouseButton::Left) {
                         let mut changed = this.update_hovered_link(&event.modifiers);
@@ -2397,17 +2470,7 @@ impl Render for GhosttyView {
                     }
                 }
                 let mut changed = this.update_hovered_link(&event.modifiers);
-                if event.pressed_button == Some(MouseButton::Left) {
-                    changed |= this.update_left_mouse_sequence(event.position, cx);
-                } else if event.pressed_button.is_none()
-                    && this.terminal_left_mouse_sequence.is_active()
-                {
-                    changed |= this.finish_left_mouse_sequence(event.position);
-                }
-                if event.pressed_button.is_none() && this.terminal_right_mouse_sequence.is_active()
-                {
-                    changed |= this.finish_right_mouse_sequence(event.position);
-                }
+                changed |= this.update_mouse_sequences(event, cx);
                 if changed {
                     cx.notify();
                 }
@@ -2416,6 +2479,7 @@ impl Render for GhosttyView {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
                     if this.suppress_link_mouse_up {
                         let down_link = this.mouse_down_link.take();
                         this.suppress_link_mouse_up = false;
@@ -2448,6 +2512,7 @@ impl Render for GhosttyView {
                         return;
                     }
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
                     this.mouse_down_link = None;
                     this.suppress_link_mouse_up = false;
                     let mut changed = this.finish_left_mouse_sequence(event.position);
@@ -2461,6 +2526,7 @@ impl Render for GhosttyView {
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
                     if this.finish_right_mouse_sequence(event.position) {
                         cx.notify();
                     }
@@ -2473,11 +2539,74 @@ impl Render for GhosttyView {
                         return;
                     }
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
                     if this.finish_right_mouse_sequence(event.position) {
                         cx.notify();
                     }
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    let _ = this.ensure_session(cx);
+                    this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_middle_mouse_sequence(event.position);
+                    if !event.modifiers.shift
+                        && this.report_mouse(
+                            event.position,
+                            VtMouseAction::Press,
+                            Some(VtMouseButton::Middle),
+                        )
+                    {
+                        this.terminal_middle_mouse_sequence.begin(());
+                        cx.stop_propagation();
+                    }
+                    cx.emit(GhosttyFocusChanged);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_middle_mouse_sequence(event.position);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_middle_mouse_sequence(event.position);
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                if event.modifiers.shift {
+                    return;
+                }
+                this.mouse_modifiers = event.modifiers;
+                let delta = match event.delta {
+                    ScrollDelta::Lines(delta) => delta,
+                    ScrollDelta::Pixels(delta) => point(f32::from(delta.x), f32::from(delta.y)),
+                };
+                // Match Windows: one directional report per host wheel event,
+                // not a burst of synthetic presses proportional to acceleration.
+                let mut reported = false;
+                for (amount, negative, positive) in [
+                    (delta.y, VtMouseButton::Button5, VtMouseButton::Button4),
+                    (delta.x, VtMouseButton::Button7, VtMouseButton::Button6),
+                ] {
+                    if amount.abs() < f32::EPSILON {
+                        continue;
+                    }
+                    let button = if amount < 0.0 { negative } else { positive };
+                    reported |=
+                        this.report_mouse(event.position, VtMouseAction::Press, Some(button));
+                }
+                if reported {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 div()
                     .relative()
@@ -3410,10 +3539,10 @@ fn vt_color_to_hsla(packed: u32) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUNDLED_LINUX_FONT_FAMILY, DEFAULT_FONT_SIZE, KITTY_BELOW_BACKGROUND_LIMIT,
+        BUNDLED_LINUX_FONT_FAMILY, CursorStyle, DEFAULT_FONT_SIZE, KITTY_BELOW_BACKGROUND_LIMIT,
         KittyImageLayer, MIN_FONT_SIZE_PX, build_terminal_row, cell_height_px, cell_width_px,
-        effective_font_size, kitty_image_to_render_image, kitty_placement_geometry,
-        physical_cell_size, rows_needing_refresh, vt_color_to_hsla,
+        cursor_overlay_cell, effective_font_size, kitty_image_to_render_image,
+        kitty_placement_geometry, physical_cell_size, rows_needing_refresh, vt_color_to_hsla,
     };
     use con_ghostty::{
         ATTR_BOLD, ATTR_INVERSE, ATTR_UNDERLINE, KittyImage, KittyPlacement, ScreenSnapshot,
@@ -3421,6 +3550,157 @@ mod tests {
     };
     use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Rgba};
     use std::sync::Arc;
+
+    fn mouse_test_view(cx: &mut gpui::TestAppContext) -> gpui::Entity<super::GhosttyView> {
+        use con_ghostty::linux::pty::LinuxPtyOptions;
+        use gpui::{AppContext, Bounds, point, px, size};
+        use std::time::{Duration, Instant};
+
+        let app = Arc::new(
+            con_ghostty::GhosttyApp::new(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, false,
+            )
+            .unwrap(),
+        );
+        let view = cx.new(|cx| super::GhosttyView::new(app, None, None, None, 14.0, cx));
+        view.update(cx, |view, _cx| {
+            let terminal = view.terminal().unwrap();
+            let mut options = LinuxPtyOptions::default();
+            options.command_program = Some("/bin/sh".into());
+            options.command_args = Some(vec![
+                "-c".into(),
+                "stty raw -echo; printf '\x1b[?1002h\x1b[?1006hREADY'; exec sleep 30".into(),
+            ]);
+            options.size = con_ghostty::SurfaceSize {
+                columns: 80,
+                rows: 24,
+                width_px: 1120,
+                height_px: 720,
+                cell_width_px: 14,
+                cell_height_px: 30,
+            };
+            terminal.spawn_with_options(options).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !terminal.read_recent_lines(24).join(" ").contains("READY") {
+                assert!(Instant::now() < deadline, "mouse test PTY not ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            view.refresh_snapshot();
+            view.scale_factor = 1.5;
+            view.pane_bounds = Some(Bounds::new(
+                point(px(31.0), px(47.0)),
+                size(px(800.0), px(520.0)),
+            ));
+        });
+        view
+    }
+
+    #[gpui::test]
+    fn mouse_presses_reject_padding_but_captured_events_can_leave_grid(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{VtMouseAction as Action, VtMouseButton as Button};
+        use gpui::{point, px};
+
+        let view = mouse_test_view(cx);
+        view.update(cx, |view, _cx| {
+            // 1.5x scale: grid begins at (43, 57), cells are 14x30 device px.
+            for button in [
+                Button::Left,
+                Button::Middle,
+                Button::Right,
+                Button::Button4,
+                Button::Button7,
+            ] {
+                for (x, y) in [(42.5, 80.0), (60.0, 56.5), (790.0, 80.0), (60.0, 537.0)] {
+                    assert!(
+                        !view.report_mouse(point(px(x), px(y)), Action::Press, Some(button)),
+                        "padding press {button:?} at ({x}, {y})"
+                    );
+                }
+                assert!(view.report_mouse(point(px(43.0), px(57.0)), Action::Press, Some(button)));
+            }
+            assert!(view.report_mouse(
+                point(px(789.5), px(536.5)),
+                Action::Press,
+                Some(Button::Left)
+            ));
+            let outside = point(px(20.0), px(40.0));
+            assert!(view.report_mouse(outside, Action::Motion, Some(Button::Left)));
+            assert!(view.report_mouse(outside, Action::Release, Some(Button::Left)));
+        });
+    }
+
+    #[gpui::test]
+    fn buttonless_motion_retains_chord_capture_until_matching_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{LeftMouseSequence, VtMouseAction as Action, VtMouseButton as Button};
+        use gpui::{MouseMoveEvent, point, px};
+
+        let view = mouse_test_view(cx);
+        view.update(cx, |view, cx| {
+            let position = point(px(73.0), px(121.0));
+            assert!(view.report_mouse(position, Action::Press, Some(Button::Middle)));
+            view.terminal_middle_mouse_sequence.begin(());
+            assert!(view.report_mouse(position, Action::Press, Some(Button::Left)));
+            view.terminal_left_mouse_sequence
+                .begin(LeftMouseSequence::TerminalReport);
+            assert!(view.finish_left_mouse_sequence(position));
+            // Cross a cell boundary: same-cell motion is correctly deduplicated.
+            let position = point(px(103.0), px(161.0));
+            let generation = view.terminal().unwrap().input_generation();
+            view.update_mouse_sequences(
+                &MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert!(view.terminal_middle_mouse_sequence.is_active());
+            assert_eq!(view.terminal().unwrap().input_generation(), generation + 1);
+            assert!(view.finish_middle_mouse_sequence(position));
+            assert!(!view.finish_middle_mouse_sequence(position));
+            let generation = view.terminal().unwrap().input_generation();
+            view.update_mouse_sequences(
+                &MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                },
+                cx,
+            );
+            // Button-event mode must not emit hover once the actual release arrives.
+            assert_eq!(view.terminal().unwrap().input_generation(), generation);
+        });
+    }
+
+    #[gpui::test]
+    fn hover_exit_retains_middle_capture_until_focus_cancellation(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, point, px};
+
+        let app = Arc::new(
+            con_ghostty::GhosttyApp::new(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, false,
+            )
+            .unwrap(),
+        );
+        let view =
+            cx.new(|cx| super::GhosttyView::new(app, None, None, None, DEFAULT_FONT_SIZE, cx));
+        view.update(cx, |view, _cx| {
+            let position = point(px(73.0), px(121.0));
+            view.last_mouse_position = Some(position);
+            view.terminal_middle_mouse_sequence.begin(());
+            view.clear_hovered_link();
+            assert_eq!(view.last_mouse_position, Some(position));
+            assert!(view.terminal_middle_mouse_sequence.is_active());
+
+            view.set_surface_focus_state(false);
+            assert!(!view.terminal_middle_mouse_sequence.is_active());
+            assert!(!view.finish_middle_mouse_sequence(position));
+            view.clear_hovered_link();
+            assert_eq!(view.last_mouse_position, None);
+        });
+    }
 
     fn base_font() -> Font {
         Font {
